@@ -1,66 +1,173 @@
-# Forge: a local, transactional, multi-agent coding system
+# Forge
 
-Ollama + Qwen3.5, no paid APIs. One model plays eight roles; a controller (not the model) enforces the process.
-You **talk first** (explain, compare, brainstorm, ask follow-ups for as long as you like), and a coding task starts only when your wording and a confirmation say so.
+A coding assistant that runs entirely on my own machine. It uses Ollama and Qwen3.5, so there are no API keys, no usage bills, and my code never leaves the laptop.
 
-## Quick start (Windows)
+I built it for my own project, which is a monorepo with three parts (frontend, backend, admin) and somewhere around 30 to 50k lines. I wanted something that could change code across all three without me babysitting it, and I didn't want it to break things when it got confused. Most of Forge is built around that second part.
+
+## What it does
+
+You talk to it like you would talk to a person. Ask how something works, compare two ideas, think out loud. When you actually want a change made, it plans the work, makes the edits in a private copy of your repo, runs your project's own checks, has a second pass review the result, and only writes to your real files after you approve. If anything goes wrong along the way, your files stay exactly as they were.
+
+## Features
+
+### Chat first
+
+- **Talk before building.** Nothing touches your code just because you mentioned an idea. Questions and "what if" messages stay as conversation.
+- **It reads your intent.** Every message is checked two ways: simple wording rules (hedging, questions, "go ahead") and a small model call. A controller combines them. A task never starts from a half-formed idea.
+- **Unclear requests get questions.** If a change request is missing something important, it asks specific questions instead of guessing.
+- **Clear requests become a brief.** You get a card with a title, the full request, the assumptions it made and anything still open. Start it, edit it, or say "not yet".
+- **Saying "go ahead" works.** If you clearly say "do it" and nothing is ambiguous, it starts straight away. You can turn this off in Settings so it always asks first.
+- **Answers are based on your real code.** Name a file or a function and it opens it from the index. Broader questions trigger a short read-only look through the repo. The chat shows what it looked at.
+- **Long chats don't fall apart.** Each reply is built from saved memory, a rolling summary of the older conversation, older messages found by full-text search, and the newest messages as they are. So "what did we name that job earlier?" still works fifty messages later.
+- **Chats behave like you'd expect.** Chat list, search, rename, delete, automatic titles, and a draft that is saved per chat so a refresh never eats what you were typing.
+- **Slash commands.** `/task ...` skips the discussion, `/remember ...` saves a note, `/forget ...` removes one.
+
+### Memory
+
+Forge keeps durable facts from your chats: preferences, decisions, project knowledge, goals and conventions. They are pulled out in the background, shown in the Memory tab (add, search, edit, forget) and brought back whenever they're relevant, in any chat and inside the planner and coder prompts.
+
+- A correction replaces the old fact instead of piling up next to it.
+- Anything that looks like a key, token or password is never saved.
+- Facts learned from code are tied to the hash of the files they came from. When a file changes, the fact is treated as outdated and stops being used.
+- Everything is also exported as readable markdown in `.forge/memory/`.
+
+### The task pipeline
+
+1. **Planner** investigates the repo with read-only tools, then writes a plan. The number of subtasks depends on the work. A one-line fix is one subtask, a feature that touches the database, backend and UI can be many. Plans are validated before anything runs (paths must exist, no circular dependencies, file limits per subtask).
+2. **Context agent** builds the prompt for each step from the index: the files to change, the interfaces they import, real call sites, related tests, search hits and remembered facts. Big files are shown as windows with an outline of what was left out.
+3. **Coder** edits with SEARCH/REPLACE blocks. If it isn't sure about a function, a variable or a table column, it has to say so instead of inventing one. Every symbol it relies on is checked against the index.
+4. **Checks** run on the copy: syntax, imports, lint, typecheck, related tests and build. A check that was already failing before the change is reported but not blamed on the agent.
+5. **Reviewer** goes through each acceptance criterion against the diff and the check output. Failures go back to the coder, then the step is split into smaller ones, and if that still fails it comes to you.
+6. **Final pass.** A whole-request review and the full set of checks run, then you approve, then it is applied.
+
+When something is unclear, questions go to the context agent first. It tries to answer from the code. Only if the code doesn't say, you get asked.
+
+### Safety and atomic writes
+
+- All edits happen in an isolated copy of the repo. `node_modules` is linked, not copied.
+- Every retry starts from a checkpoint, so failed attempts leave nothing behind.
+- Applying is a journaled all-or-nothing write. Before anything changes it checks that every target file is still what the run started from. Originals are backed up, new versions are written to temp files and swapped in. If any step fails, everything is rolled back. If the machine dies halfway, the rollback happens on the next start.
+- If you edited an affected file while a task was running, the apply is refused and nothing is written.
+- Undo restores the originals, as long as those files haven't been edited since.
+- Files like `.env`, keys and certificates are never read into prompts and never written.
+- The server only listens on `127.0.0.1`, rejects other Host headers and only accepts JSON for writes. Model output is shown as plain text, never as HTML.
+- Agents can't run arbitrary commands. Only your project's own lint, test and build commands run, and only inside the copy.
+
+One honest limit: no filesystem gives a single atomic multi-file write. This is all-or-nothing with crash recovery, which is close, but keep git as your outer safety net.
+
+### Pipeline view
+
+There's a Pipeline tab that shows what actually happens to a message, step by step. It was added because the whole thing felt slow and I wanted to know why.
+
+- One node per stage (wording check, router, controller, context, chat model, and for tasks the planner, coder, checks and reviewer). The active one glows while it is running.
+- A timeline with true start times for every step. Each model call is split into waiting for Ollama, loading the model, reading the prompt and writing the answer. Those numbers come from Ollama's own timings, nothing is estimated for the animation.
+- A line at the top saying which step used the most time and what the main reason was.
+- Click any step to see what was sent to the model, what came back, tokens per second and the full breakdown.
+- The header shows how much of the model is sitting on the GPU, which turned out to matter a lot on my machine.
+
+### Other things worth mentioning
+
+- **Code index.** SQLite with full-text search. It knows symbols, the import graph, exports, API routes and Supabase table and RPC references. JS, TS, JSX and TSX are handled with a brace-aware scanner, Python with `ast`, SQL with a scanner that understands dollar quoting. Refreshes only re-read files that changed.
+- **Pause, cancel, resume.** A running task can be paused or cancelled. If the server restarts mid-run, the task is marked interrupted and can be resumed.
+- **Request changes after review.** Instead of applying or discarding, you can ask for a follow-up and it plans just that.
+- **Light and dark theme**, and the layout works on a narrow window.
+
+## Setup (Windows)
+
+You need Python 3.12 or newer (`agents.py` uses nested quotes inside f-strings, which 3.11 rejects), Ollama, Git, and Node if your project has lint, test or build scripts.
+
 ```
-pip install -r requirements.txt          (Python 3.12+)
-ollama pull qwen3.5:9b                   (and/or qwen3.5:4b)
-npm install                              (once, in frontend/, backend/, admin/ so lint/test/build gates can run)
+pip install -r requirements.txt
+ollama pull qwen3.5:9b
+ollama pull qwen3.5:4b
+```
+
+In your target project, run `npm install` once in `frontend/`, `backend/` and `admin/` so the checks can run.
+
+Then check everything is wired up:
+
+```
 python -m forge doctor --repo C:\path\to\project
-start.bat C:\path\to\project             (opens http://127.0.0.1:8765)
 ```
-Headless: `python -m forge run "your request" --repo . ` · Tests: `python -m pytest tests -q`
 
-> Python 3.12+ is required (agents.py uses nested quotes inside f-strings, which 3.11 rejects).
+Start it:
 
-## Chat mode
+```
+start.bat C:\path\to\project
+```
 
-* **Chats** work like ChatGPT/Claude: a list on the left, search across titles and message text, rename, delete. A new chat is created when you send the first message and is **named automatically** from the first exchange (refined after the third message). A name you set yourself is never overwritten.
-* **No fixed number of messages before a task.** Every message is read two ways: deterministic wording signals (`forge/intent.py`) and a small JSON "router" call. A controller combines them:
-  * questions, "what if / should we / explain" wording, or a low-confidence reading → **discuss** (never a task)
-  * a change request with missing pieces → **asks you specific questions**, starts nothing
-  * a clear change request → a **task brief card** (title, full request, assumptions, still-open points). Press *Start task*, edit it first, say "go ahead", or say "not yet"
-  * "do it / go ahead / start" said clearly, with high confidence, no hedging and no open questions → starts straight away (switch off in *Settings*)
-  * "yes" / "go ahead" with nothing pending is never treated as a command to build something
-  * *Make this a task* under any answer turns the discussion so far into a brief; *Run as task* (or `/task ...`) skips the discussion
-* **Answers are grounded in your real code.** File and function names you mention are opened instantly from the index; broader questions trigger a short read-only investigation. The chat shows what was looked at.
-* **Follow-ups at any depth.** Each reply is built from: recalled memory facts, a rolling summary of the older conversation, a digest of anything not yet summarised, older messages retrieved by full-text search (so "what was that job we named earlier?" works after 50 exchanges), the newest messages verbatim, the state of any running task, and the diff of the last finished task when you ask about changes. Everything is packed into the model's token budget.
-* **Tasks live inside the chat.** A task card shows progress; questions, approvals and blockers appear in a panel above the message box; the finished result is written back into the conversation so you can ask "why did you change X?".
+That opens `http://127.0.0.1:8765`.
 
-## Memory (facts, like Claude)
+Other commands:
 
-Durable facts (preferences, decisions, project knowledge, goals, conventions) are extracted from your chats in the background, shown in the **Memory** tab (add, search, forget), and recalled whenever they are relevant, in every chat and in the planner/coder prompts. A correction supersedes the old fact; "forget ..." removes it; `/remember ...` and `/forget ...` work as commands. Secrets (keys, tokens, passwords) are never saved. Facts derived from code are tied to file hashes and expire when the file changes.
+```
+python -m forge serve --repo . --port 8765 --no-browser
+python -m forge index --repo .
+python -m forge run "your request" --repo . --auto-approve
+```
 
-## 9B or 4B?
-Switch in **Settings** (or `profile = "fast"`). Weights are about 6.6 GB (9B) and 3.4 GB (4B) at Q4. With 4 GB VRAM the 4B
-is the only one that mostly fits on the GPU; the 9B spills into system RAM and is slower but generally more reliable at code.
-Forge uses one model and one context size for every role because Ollama keeps a single model resident (a different `num_ctx` also forces a reload).
-Replies stream token by token; background work (title, summary, memory) pauses the moment you send a message.
+`run` skips the UI and works from the terminal. Without `--auto-approve` it asks before applying.
 
-## The task pipeline
-1. **Planner** investigates with read-only tools, then emits a validated plan with as many subtasks as the work needs. Blocking ambiguities go to you first.
-2. **Context agent** builds each coder prompt from a SQLite/FTS5 index (symbols, import graph, call sites, tests, remembered facts) within the token budget. Big files are windowed.
-3. **Coder** edits with SEARCH/REPLACE blocks and must say `NEED_INFO` instead of guessing; every symbol it relies on is checked against the index.
-4. **Gates** (objective): syntax, imports, lint, typecheck, related tests, build. A gate that already failed before the change is not blamed on the agent.
-5. **Reviewer** checks each acceptance criterion against the diff and gate output; failures go back to the coder, then the step is re-planned smaller, then you decide.
-6. **Whole-request review + final gates**, then your approval, then the commit.
+## Choosing a model
 
-## Atomicity (ACID-style)
-* All edits happen in an isolated copy (`node_modules` linked, not copied). Failed attempts are rolled back to a checkpoint.
-* Commit = journaled transaction: verify every target still equals the version the run started from, back up originals, write temp files, swap them in, fsync. Any error rolls **all** files back; a crash mid-commit is rolled back on next start.
-* If you edited an affected file during the run, the commit is refused (nothing written). **Undo** restores the originals if those files were not edited since.
-Honest limit: no filesystem offers a single atomic multi-file write; this gives all-or-nothing with crash recovery. Keep git as your outer safety net.
+There are two profiles, switchable in Settings or with `profile = "fast"` in the config.
 
-## Data (`.forge/`)
-`memory.db` holds facts, **conversations and messages** (with a full-text index), run history and the event log. `.forge/memory/*.md` is a readable export of the facts.
+| Profile | Model | Notes |
+| --- | --- | --- |
+| quality | `qwen3.5:9b` | Better at code, slower |
+| fast | `qwen3.5:4b` | Fits a small GPU much better |
 
-## Safety
-Binds to 127.0.0.1, rejects foreign Host headers and non-JSON writes. Model output is rendered as text only (a small markdown renderer builds DOM nodes; no `innerHTML`). Secret-like files (`.env*`, keys) are never read into prompts or written. Agents cannot run arbitrary commands: only your project's own lint/test/build commands run, inside the copy.
+Forge uses one model and one context size for every role. Ollama keeps a single model loaded, and switching models or context size forces a reload, which is painful on limited memory. I run this on 16 GB of RAM with 4 GB of VRAM, so the 9B spills into system RAM and is noticeably slow. The 4B is the one that mostly fits on the GPU. If it feels slow, open the Pipeline tab and check the GPU percentage and the tokens per second before changing anything else.
 
-## What changed in this version
-* new: `forge/chat.py`, `forge/intent.py`, `tests/test_chat.py`
-* updated: `config.py` (chat + router roles, `[chat]` settings, fix: switching from a custom model back to a profile now works), `llm.py` (`chat_stream`), `memory.py` (conversations, messages, full-text search, thread-safe reads), `server.py` (chat endpoints, live event stream, memory add/edit), `ui/*` (chat-first interface)
-* fixed: the message box cleared itself while typing. The old UI rebuilt the whole page (including the text box) every few seconds. The new composer is never re-rendered, and drafts are saved per chat.
-* unchanged: orchestrator, agents, context, indexer, patching, verify, workspace, cli
+## Configuration
+
+Copy `config.example.toml` to `<your-project>/.forge/config.toml`. Settings changed in the UI are saved to `.forge/settings.json` and override the file.
+
+A few settings that matter:
+
+- `scope_policy`: `strict`, `related` or `free`. Controls which files a subtask is allowed to edit.
+- `require_approval`: whether anything is written without you approving it.
+- `[chat]`: `auto_start`, `research_steps` (how many read-only lookups a chat answer may make), `memory_chars`, `summary_trigger`, `keep_recent`.
+- `[limits]`: `max_attempts` per subtask, `max_files_per_task`, `max_subtasks`, `max_replans`.
+- `[verify.commands.<project>]`: set your own lint, test or build command for `frontend`, `backend` or `admin` instead of relying on auto-detection.
+- `[aliases]`: only needed if your `@/` style import aliases aren't detected from tsconfig or vite.
+
+## Where things live
+
+```
+forge/
+  chat.py          chat service: routing, briefs, context assembly, background jobs
+  intent.py        simple wording checks (question, hedge, go-ahead, confirm)
+  orchestrator.py  runs a task: plan, execute, verify, review, approve, apply
+  agents.py        planner, coder prompts, reviewer, context agent
+  context.py       builds the prompt for the coder within the token budget
+  indexer.py       code index (symbols, imports, search)
+  patching.py      parses and applies SEARCH/REPLACE edits
+  verify.py        syntax, imports, lint, typecheck, test, build checks
+  workspace.py     isolated copy, journaled apply, rollback, undo
+  memory.py        facts, chats, messages, run history (SQLite)
+  llm.py           Ollama client (streaming, JSON output, cancel, retries)
+  telemetry.py     real timings behind the Pipeline view
+  server.py        local API and UI host
+  cli.py           serve, doctor, index, run
+ui/                plain HTML, CSS and JS, no build step
+tests/             pytest
+```
+
+Runtime data goes into a `.forge/` folder inside the project Forge is working on: the memory database, the code index, settings, journals for rollback and run history.
+
+## Tests
+
+```
+python -m pytest tests -q
+```
+
+The chat tests use a scripted stand-in for Ollama, so they don't need a model or a repo.
+
+## Known limits
+
+- It's only as good as a 4B or 9B local model. Expect to review the diffs, especially on bigger changes.
+- Speed depends heavily on your GPU. On a small card the 9B is slow.
+- JS and TS parsing is a scanner, not a full parser, so unusual syntax can occasionally confuse the index.
+- The apply step is all-or-nothing with crash recovery, not a true atomic write.
+- Windows is the platform I use and test on.
