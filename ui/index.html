@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314181d'/%3E%3Cpath d='M7 21h18v3H7zM11 11h10l3 6H8z' fill='%23e0a526'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header class="top">
+    <button class="btn ghost icon only-small" id="railToggle" aria-label="Show chats" aria-controls="rail">☰</button>
+    <div class="brand"><svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><path d="M7 21h18v3H7zM11 11h10l3 6H8z" fill="currentColor"/></svg><span>Forge</span></div>
+    <div class="repo" id="repoPath" title="Repository"></div>
+    <div class="spacer"></div>
+    <div class="pill" id="ollamaPill" role="status"></div>
+    <button class="btn ghost" id="settingsBtn" aria-haspopup="dialog">Settings</button>
+    <button class="btn ghost icon" id="themeBtn" aria-label="Toggle light or dark theme" title="Theme">◐</button>
+    <button class="btn ghost only-mid" id="inspToggle" aria-controls="inspector">Details</button>
+  </header>
+
+  <aside class="rail" id="rail" aria-label="Chats">
+    <button class="btn primary wide" id="newChatBtn">New chat</button>
+    <div class="search"><input id="chatSearch" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off"></div>
+    <nav class="chatlist" id="chatList" aria-label="Chat list"></nav>
+    <div class="rail-foot">
+      <div id="indexInfo" class="dim small"></div>
+      <button class="btn ghost small" id="reindexBtn">Refresh code index</button>
+    </div>
+  </aside>
+
+  <main class="chat" id="chat">
+    <div class="chat-head">
+      <h1 id="chatTitle">New chat</h1>
+      <div class="chat-sub dim small" id="chatSub"></div>
+    </div>
+    <div class="scroller" id="scroller">
+      <div class="thread" id="thread" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation">
+        <div id="older"></div>
+        <div id="hero" class="hero"></div>
+        <div id="msgs" class="msgs"></div>
+        <div id="liveHost"></div>
+      </div>
+    </div>
+    <button class="jump" id="jumpBtn" hidden>Jump to latest</button>
+    <div class="dock">
+      <div id="attn"></div>
+      <div class="status-line" id="statusLine" hidden>
+        <span class="spinner" aria-hidden="true"></span><span id="statusText"></span>
+        <button class="btn ghost small" id="stopBtn">Stop</button>
+      </div>
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Ask about your code, think something through, or describe a change" aria-label="Message" spellcheck="true"></textarea>
+        <div class="row">
+          <div class="hint dim small">Enter to send · Shift+Enter for a new line · <code>/task</code> runs it as a task</div>
+          <div class="btns">
+            <button class="btn" id="taskBtn" title="Skip the discussion and run this as a task now">Run as task</button>
+            <button class="btn primary" id="sendBtn">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="inspector" id="inspector" aria-label="Details">
+    <div class="tabs" role="tablist" id="tabs">
+      <button role="tab" data-tab="task" aria-selected="true">Task</button>
+      <button role="tab" data-tab="diff" aria-selected="false">Changes</button>
+      <button role="tab" data-tab="flow" aria-selected="false">Pipeline</button>
+      <button role="tab" data-tab="live" aria-selected="false">Live model</button>
+      <button role="tab" data-tab="context" aria-selected="false">Context</button>
+      <button role="tab" data-tab="gates" aria-selected="false">Checks</button>
+      <button role="tab" data-tab="memory" aria-selected="false">Memory</button>
+    </div>
+    <div class="panes" id="panes">
+      <section data-pane="task" id="paneTask"></section>
+      <section data-pane="diff" id="paneDiff" hidden></section>
+      <section data-pane="flow" id="paneFlow" hidden></section>
+      <section data-pane="live" id="paneLive" hidden></section>
+      <section data-pane="context" id="paneContext" hidden></section>
+      <section data-pane="gates" id="paneGates" hidden></section>
+      <section data-pane="memory" id="paneMemory" hidden></section>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+</div>
+
+<dialog id="settings">
+  <form method="dialog" class="dlg">
+    <h2>Settings</h2>
+    <p class="dim">One model runs every agent, because Ollama keeps a single model loaded and swapping models is slow on 16&nbsp;GB RAM.</p>
+    <label>Profile
+      <select id="setProfile">
+        <option value="quality">Quality: Qwen3.5 9B (slower, more reliable)</option>
+        <option value="fast">Fast: Qwen3.5 4B (fits your GPU better)</option>
+        <option value="custom">Custom model name</option>
+      </select>
+    </label>
+    <label id="customWrap" hidden>Model name <input id="setModel" placeholder="qwen3.5:9b"></label>
+    <label>Context window (tokens)
+      <select id="setCtx"><option>6144</option><option>8192</option><option>12288</option><option>16384</option><option>24576</option></select>
+    </label>
+    <label class="check"><input type="checkbox" id="setAutoStart"> Start a task right away when I clearly say “do it” (otherwise I confirm a brief first)</label>
+    <label class="check"><input type="checkbox" id="setThinkChat"> Think longer before chat replies (slower, often better)</label>
+    <label class="check"><input type="checkbox" id="setThink"> Let the planner, coder and reviewer think before answering (slower, often better)</label>
+    <label class="check"><input type="checkbox" id="setApproval"> Ask me to approve before anything is written to my files</label>
+    <div class="dlg-actions"><button class="btn ghost" value="cancel">Close</button><button class="btn primary" id="saveSettings" value="ok">Save</button></div>
+  </form>
+</dialog>
+<script src="/ui/app.js"></script>
+</body>
+</html>

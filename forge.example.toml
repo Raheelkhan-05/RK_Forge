@@ -1,0 +1,51 @@
+# Copy to <your-project>/.forge/config.toml  (the UI's "Settings" writes .forge/settings.json on top of this)
+
+# top-level keys must come before the first [table], otherwise TOML files them under that table
+scope_policy = "related"       # strict | related | free  (which files a subtask may edit)
+require_approval = true
+
+[ollama]
+host = "http://127.0.0.1:11434"
+profile = "quality"            # quality = qwen3.5:9b | fast = qwen3.5:4b
+
+# Override any role. One model for all roles is recommended: Ollama keeps ONE model loaded,
+# so mixing models forces slow reloads on 16 GB RAM / 4 GB VRAM. Keep num_ctx identical for all roles too.
+[models]
+# default = "qwen3.5:9b"
+# coder = "qwen3.5:9b"
+
+[context]
+# num_ctx = 12288              # raise only after checking memory use (ollama ps)
+
+[role.coder]
+# think = true                 # slower, often better. Also available for planner / reviewer / context / chat.
+[role.chat]
+# think = true                 # think longer before chat replies
+# num_predict = 1800           # maximum length of one chat reply
+
+[chat]
+auto_start = true              # start a task right away when you clearly say "go ahead" (false = always confirm a brief first)
+research_steps = 4             # read-only code lookups a chat answer may make
+memory_chars = 1600            # characters of recalled facts added to every chat turn
+summary_trigger = 3000         # fold older messages into the rolling summary beyond this many characters
+keep_recent = 8                # newest messages that are never folded into the summary
+
+[limits]
+max_attempts = 3               # coder attempts per subtask before asking you
+max_lookup_rounds = 3          # self-resolution rounds before a doubt is escalated to you
+max_subtasks = 40
+max_files_per_task = 4
+max_replans = 2
+
+[aliases]
+# "@/" = "frontend/src/"       # only needed if tsconfig/vite aliases are not auto-detected
+
+# Explicit gate commands per sub-project (otherwise auto-detected from package.json / node_modules)
+[verify.commands.frontend]
+# lint = "npm run lint"
+# test = "npm test"
+# build = "npm run build"
+[verify.commands.backend]
+# test = "npm test"
+[verify.commands.admin]
+# build = "npm run build"
