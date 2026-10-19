@@ -1,0 +1,28 @@
+{
+  "profile": "fast",
+  "models": {},
+  "context": {
+    "num_ctx": 6144
+  },
+  "require_approval": true,
+  "role": {
+    "planner": {
+      "think": true
+    },
+    "reviewer": {
+      "think": true
+    },
+    "coder": {
+      "think": true
+    },
+    "context": {
+      "think": true
+    },
+    "chat": {
+      "think": true
+    }
+  },
+  "chat": {
+    "auto_start": true
+  }
+}

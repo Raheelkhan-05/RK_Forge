@@ -225,6 +225,8 @@ class RunExecutor:
         self.tasks: list[dict] = []
         self.states: dict[str, str] = {}
         self.replans = 0
+        self.no_change = ""
+        self._diagnosed: set[str] = set()
         self.partial = False
         self.ws: Workspace | None = None
         self.six: Index | None = None
@@ -309,6 +311,9 @@ class RunExecutor:
                 self.done_lines = [f"{t['id']} {t['title']}: {t['summary']}" for t in run["tasks"] if t["status"] == "accepted"]
             else:
                 self.plan_phase()
+                if self.no_change:
+                    self.finish_without_changes()
+                    return
             self.status("running")
             self.exec_phase([t for t in self.tasks if self.states.get(t["id"]) != "accepted"])
             self.final_phase()
@@ -359,20 +364,32 @@ class RunExecutor:
     # ------------------------------------------------------------------ planning
     def plan_phase(self, followup: str | None = None) -> None:
         self.status("planning")
-        feedback, q_rounds = "", 0
+        feedback, q_rounds, looked = "", 0, 0
         request = self.request if not followup else f"{self.request}\n\nFollow-up requested by the user after reviewing the result (the current state already contains the earlier work):\n{followup}"
         existing = {t["id"] for t in self.tasks}
         new_tasks: list[dict] = []
         plan: dict = {}
+        errs: list[str] = []
         for _ in range(5):
             self.ctl.checkpoint()
             with self.stream("planner") as tok:
                 plan = self.agents.plan(request, self.answers, self.emit, tok, feedback)
+            if plan.get("no_change_needed") and not (plan.get("subtasks") or []):
+                self.no_change = (plan.get("answer") or plan.get("understanding") or "No change is needed.").strip()
+                self.emit("agent", agent="planner", message="No change is needed: " + self.no_change[:300])
+                return
             qs = [q.strip() for q in plan.get("questions", []) if q.strip()]
             new_tasks, errs = self.agents.validate_plan(plan, existing)
-            if qs and q_rounds < 2:
+            usable = bool(new_tasks) and not errs
+            if qs and usable:
+                # A usable plan means the planner could decide; its questions are assumptions, not blockers.
+                self.emit("agent", agent="planner", message="Decided these open points itself: " + " | ".join(qs[:3]))
+            elif qs and q_rounds < 2:
                 q_rounds += 1
-                self.answers += self.ask(qs, "planner", context=plan.get("understanding", ""))
+                left = self.resolve_questions(qs[:2]) if looked < 1 else qs[:3]     # try the code first, once
+                looked += 1
+                if left:
+                    self.answers += self.ask(left, "planner", context=plan.get("understanding", ""))
                 feedback = ""
                 continue
             if errs:
@@ -380,7 +397,7 @@ class RunExecutor:
                 feedback = "Your previous plan was rejected for these reasons:\n- " + "\n- ".join(errs) + "\nReturn the corrected full plan."
                 continue
             if not new_tasks:
-                feedback = "The plan contained no subtasks. Investigate again and return at least one."
+                feedback = "The plan contained no subtasks. Investigate again and return at least one (or set no_change_needed)."
                 continue
             break
         else:
@@ -390,6 +407,27 @@ class RunExecutor:
         for t in new_tasks:
             self.set_task(t, "pending")
         self.emit("plan", understanding=plan.get("understanding", ""), tasks=self.tasks)
+
+    def finish_without_changes(self) -> None:
+        self.mem.update_run(self.rid, status="done", summary=self.no_change, files=[], finished=time.time())
+        self.emit("status", status="done")
+        self.cleanup(keep=False)
+
+    def resolve_questions(self, qs: list[str]) -> list[str]:
+        """Try to answer questions from the code. Answers are kept for the run; returns what still needs a person."""
+        left = []
+        probe = {"id": "PLAN", "title": "Planning", "description": self.request[:600], "acceptance_criteria": [],
+                 "files_to_modify": [], "files_to_create": []}
+        for q in qs:
+            self.ctl.checkpoint()
+            with self.stream("context") as tok:
+                r = self.agents.resolve_doubt(q, probe, self.emit, tok)
+            self.emit("doubt", task=None, question=q, answered=r["answered"], answer=r.get("answer", "")[:400], evidence=r.get("evidence", []))
+            if r["answered"]:
+                self.answers.append(f"Q: {q}\nA: {r['answer']} (found in the code: {', '.join(r['evidence'])})")
+            else:
+                left.append(q)
+        return left
 
     # ------------------------------------------------------------------ execution
     def exec_phase(self, queue_: list[dict]) -> None:
@@ -429,6 +467,16 @@ class RunExecutor:
                     return
             except LLMError:
                 pass
+        if t["id"] not in self._diagnosed:           # one self-correction before bothering the user
+            self._diagnosed.add(t["id"])
+            with self.stream("reviewer", t["id"]) as tok:
+                hint = self.agents.diagnose(self.request, t, failure, self.emit, tok)
+            if hint:
+                self.emit("agent", agent="reviewer", message=f"Diagnosed why {t['id']} kept failing; one more attempt using that diagnosis")
+                ok, why = self.run_task(t, initial_feedback=hint, attempts=1)
+                if ok:
+                    return
+                failure = why or failure
         self.emit("status", status="blocked")
         self.mem.update_run(self.rid, status="blocked")
         payload = {"kind": "blocker", "task": t["id"], "title": t["title"], "failure": failure[-1800:], "options": ["retry", "skip", "abort"]}
@@ -447,19 +495,20 @@ class RunExecutor:
             self.partial = True
         else:
             raise RunError(f"Stopped by the user after {t['id']} could not be completed. Nothing was changed in your repository.")
-
-    def run_task(self, t: dict, initial_feedback: str = "") -> tuple[bool, str]:
+    
+    def run_task(self, t: dict, initial_feedback: str = "", attempts: int | None = None) -> tuple[bool, str]:
         ws = self.ws
         self.set_task(t, "running", 0)
         cp = ws.checkpoint()
         extras: list[str] = []
         feedback = initial_feedback
         failure = ""
-        for attempt in range(1, self.max_attempts + 1):
+        limit = attempts or self.max_attempts
+        for attempt in range(1, limit + 1):
             self.ctl.checkpoint()
             ws.restore(cp)
             self.set_task(t, "running", attempt)
-            self.emit("attempt", task=t["id"], attempt=attempt, of=self.max_attempts)
+            self.emit("attempt", task=t["id"], attempt=attempt, of=limit)
             ok, info = self._attempt(t, cp, attempt, feedback, extras)
             if ok:
                 self.done_lines.append(f"{t['id']} {t['title']}: {info}")
@@ -468,9 +517,9 @@ class RunExecutor:
             feedback = failure = info
             self.emit("retry", task=t["id"], attempt=attempt, reason=info[:700])
         ws.restore(cp)
-        self.set_task(t, "failed", self.max_attempts, failure[:300])
+        self.set_task(t, "failed", limit, failure[:300])
         return False, failure
-
+    
     def _budget(self, t: dict, feedback: str) -> int:
         rc = self.cfg.roles["coder"]
         fixed = est_tokens(fmt_task(t)) + est_tokens(self.request[:1500]) + est_tokens(feedback) + sum(est_tokens(x) for x in self.done_lines[-12:])
@@ -480,6 +529,7 @@ class RunExecutor:
         """One coder turn including doubt resolution. Returns a READY reply or a failure message."""
         L = self.cfg.limits
         rounds = 0
+        decided = False
         while True:
             self.ctl.checkpoint()
             budget = self._budget(t, feedback)
@@ -526,7 +576,17 @@ class RunExecutor:
                     else:
                         user_q.append(q)
             if user_q:
-                self.answers += self.ask(user_q, "coder", kind="doubt", context=f"{t['id']}: {t['title']}")
+                decisions = [q for q in user_q if q in asks]      # judgement calls the coder asked a person about
+                if decisions and not decided:
+                    decided = True
+                    extras.append("<decide_now>\nThese could not be answered from the code, and asking is not allowed this round:\n"
+                                  + "\n".join(f"- {q}" for q in decisions)
+                                  + "\nChoose the most conservative option that keeps existing behaviour, implement it, and state the assumption in SUMMARY. "
+                                    "Do not answer STATUS: NEED_INFO for these.\n</decide_now>")
+                    self.emit("agent", agent="system", message="Could not find this in the code; the coder will choose the safest option instead of asking you")
+                    user_q = [q for q in user_q if q not in decisions]
+                if user_q:
+                    self.answers += self.ask(user_q, "coder", kind="doubt", context=f"{t['id']}: {t['title']}")
 
     def _attempt(self, t: dict, cp: dict, attempt: int, feedback: str, extras: list[str]) -> tuple[bool, str]:
         ws = self.ws

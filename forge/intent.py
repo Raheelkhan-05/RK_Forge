@@ -49,6 +49,13 @@ REMEMBER = re.compile(r"(?i)^\s*(?:please\s+)?(?:remember|note\s+(?:that|this|do
 CORRECTION = re.compile(
     r"(?i)\b(?:forget\s+(?:that|this|about|what)|ignore\s+(?:that|what\s+i\s+said)|that'?s\s+(?:wrong|not\s+right|incorrect|outdated)|"
     r"no\s+longer|not\s+anymore|changed\s+my\s+mind|instead\s+of)\b")
+FIX_REF = re.compile(
+    r"(?i)^\s*(?:(?:please|pls|ok(?:ay)?|now|so|then|hey)[\s,]+)*"
+    r"(?:(?:fix|correct|repair|redo|retry|re-?run|try)\s+(?:it|that|this|yourself|again|the\s+(?:error|failure|problem|issue|task))"
+    r"|try\s+again|do\s+(?:it|that)\s+again|run\s+(?:it|that)\s+again|self[- ]?correct)\b")
+DECIDE = re.compile(
+    r"(?i)\b(?:you\s+decide|decide\s+(?:it\s+)?(?:yourself|for\s+(?:me|us))|your\s+(?:call|choice)|use\s+your\s+(?:best\s+)?judge?ment|"
+    r"whatever\s+(?:you\s+)?(?:think|prefer|want)|i\s+(?:don'?t|do\s+not)\s+know|not\s+sure|no\s+idea|tum\s+decide|aap\s+decide|khud\s+decide|jo\s+theek\s+lage)\b")
 CHANGE_REF = re.compile(r"(?i)\b(?:diff|changed?|changes|what\s+did\s+you|which\s+files?|files?\s+(?:did|are)|modified|edited|your\s+(?:change|edit|implementation|fix)|that\s+task|the\s+task|last\s+task)\b")
 MEMORY_REF = re.compile(
     r"(?i)\b(?:remember|memory|memories|what\s+do\s+you\s+know|do\s+you\s+recall|what\s+did\s+we\s+(?:decide|discuss|say|talk)|earlier|"
@@ -76,6 +83,8 @@ class Signals:
     remember: bool = False
     correction: bool = False
     change_ref: bool = False
+    fix_ref: bool = False
+    decide: bool = False
     memory_ref: bool = False
 
     def describe(self, pending: bool = False) -> str:
@@ -99,6 +108,8 @@ def analyze(text: str) -> Signals:
     s.correction = bool(CORRECTION.search(t))
     s.change_ref = bool(CHANGE_REF.search(t))
     s.memory_ref = bool(MEMORY_REF.search(t))
+    s.fix_ref = bool(FIX_REF.search(t)) and s.words <= 25
+    s.decide = bool(DECIDE.search(t)) and s.words <= 20
     return s
 
 

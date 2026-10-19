@@ -10,7 +10,7 @@ from typing import Callable
 from .config import Config
 from .context import ContextBuilder
 from .indexer import Index
-from .llm import OllamaLLM, est_tokens
+from .llm import CHARS_PER_TOKEN, LLMError, OllamaLLM, est_tokens
 from .memory import Memory
 from .workspace import TxError, Workspace, is_secret, norm_rel
 
@@ -21,6 +21,7 @@ S_STR = {"type": "string"}
 S_STRS = {"type": "array", "items": S_STR}
 PLAN_SCHEMA = {"type": "object", "properties": {
     "understanding": S_STR, "questions": S_STRS,
+    "no_change_needed": {"type": "boolean"}, "answer": S_STR,
     "subtasks": {"type": "array", "items": {"type": "object", "properties": {
         "id": S_STR, "title": S_STR, "description": S_STR, "files_to_modify": S_STRS, "files_to_create": S_STRS,
         "files_to_read": S_STRS, "focus_symbols": S_STRS, "acceptance_criteria": S_STRS, "depends_on": S_STRS},
@@ -45,6 +46,8 @@ SUMMARY_SCHEMA = {"type": "object", "properties": {
     "facts": {"type": "array", "items": {"type": "object", "properties": {
         "kind": {"type": "string", "enum": ["fact", "decision", "convention", "gotcha"]}, "text": S_STR, "paths": S_STRS},
         "required": ["kind", "text"]}}}, "required": ["summary", "facts"]}
+DIAGNOSE_SCHEMA = {"type": "object", "properties": {"cause": S_STR, "fix": S_STR}, "required": ["cause", "fix"]}
+DIAGNOSE_SYS = """You unblock a coding agent that failed the same subtask several times. Read the failure output, state the single most likely root cause and ONE concrete, minimal fix (name the file and the exact change). Do not ask questions. Do not suggest changing files outside the subtask."""
 
 # ------------------------------------------------------------------------------------------------ prompts
 PLANNER_SYS = """You are the Planning Agent of an automated software-engineering pipeline working on an existing repository that contains several sub-products (for example frontend, backend, admin, database).
@@ -57,7 +60,9 @@ Principles:
 - Never plan edits to code you have not seen. If something you need is missing, investigate more.
 - acceptance_criteria must be observable in code, tests or build output ("saveGst() sends the gst field", not "works well").
 - focus_symbols: names of the functions/components/classes that will change (helps the coder see the right code).
-- If a business rule, naming decision or requirement is genuinely ambiguous and changes the implementation, list it in "questions" (short, specific, only blocking ones). Otherwise decide and proceed."""
+- If a business rule, naming decision or requirement is genuinely ambiguous and changes the implementation, list it in "questions" (short, specific, only blocking ones). Otherwise decide and proceed.
+- If the request needs no code change (it is advice, a question, or the code already behaves as asked), return an empty subtasks list, set no_change_needed to true and explain in "answer". Never invent edits just to have something to change.
+- Never ask the user about anything the repository, the request or the saved memory can tell you (frameworks, tools, file locations, hardware, existing behaviour). If a reasonable choice exists, make it and continue. Ask only when two very different outcomes are equally likely and no evidence helps."""
 
 INVESTIGATE_SYS = """You are a read-only code investigator. Each turn choose ONE action and I will run it and show you the result.
 Actions: search(arg=keywords) | find_symbol(arg=name) | read_file(arg=path,start,end) | grep(arg=text) | importers(arg=path) | list_dir(arg=dir) | finish.
@@ -179,9 +184,21 @@ class Agents:
         self.llm, self.cfg, self.ix, self.ws, self.ctx, self.mem = llm, cfg, ix, ws, ctx, mem
         self.tools = ToolBox(ix, ws, ctx)
 
+    def diagnose(self, request: str, task: dict, failure: str, emit: Emit, on_token=None) -> str:
+        user = f"<request>\n{request[:800]}\n</request>\n{fmt_task(task)}\n<failure>\n{failure[:2200]}\n</failure>"
+        try:
+            d = self.llm.chat_json("reviewer", [{"role": "system", "content": DIAGNOSE_SYS}, {"role": "user", "content": user}],
+                                   DIAGNOSE_SCHEMA, on_token, retries=1)
+        except LLMError:
+            return ""
+        if not (d.get("cause") or d.get("fix")):
+            return ""
+        return f"Root cause: {d.get('cause', '')}\nFix to apply: {d.get('fix', '')}".strip()
+    
     # ------------------------------------------------------------------ investigation loop (planner + context agent)
     def investigate(self, role: str, goal: str, finish_hint: str, seed: str, max_steps: int, emit: Emit, on_token) -> tuple[list[str], dict | None]:
-        budget_chars = int(self.cfg.roles[role].prompt_budget() * 3.0)
+        budget_chars = min(int(self.cfg.roles[role].prompt_budget() * CHARS_PER_TOKEN), 7000)
+
         obs: list[str] = []
         final = None
         sys_prompt = INVESTIGATE_SYS.format(goal_finish=finish_hint)
@@ -199,7 +216,7 @@ class Agents:
                 break
             key = (action, d.get("arg"), d.get("start"), d.get("end"))
             if key in seen_calls:
-                obs.append(f"{action}({d.get('arg')}) was already run. Use the earlier result or try something different, or finish.")
+                obs.append(f"{action}({d.get('arg', '')}{'' if d.get('start') is None else f', {d.get("start")}-{d.get("end")}'}):\n{result[:1600]}")
                 continue
             seen_calls.add(key)
             result = self.tools.run(action, d.get("arg", ""), d.get("start"), d.get("end"))
@@ -211,8 +228,10 @@ class Agents:
     def plan(self, request: str, answers: list[str], emit: Emit, on_token, feedback: str = "") -> dict:
         card = self.mem.meta_get("project_card", "") or self.ix.repo_map(3500)
         facts = self.mem.recall(request, [], self.ctx._hash, 1800)
+        likely = "\n".join(f"{h.path}:{h.start}-{h.end}  [{h.symbols}]" for h in self.ix.search(request, 8))
         seed = (f"<project_map>\n{card[:3500]}\n</project_map>\n"
                 + ("<project_memory>\n" + "\n".join(f"- [{f['kind']}] {f['text']}" for f in facts) + "\n</project_memory>\n" if facts else "")
+                + (f"<likely_files>\n{likely}\n</likely_files>\n" if likely else "")
                 + (f"<answers_from_user>\n" + "\n".join(f"- {a}" for a in answers) + "\n</answers_from_user>\n" if answers else "")
                 + f"<request>\n{request}\n</request>")
         emit("agent", agent="planner", message="Investigating the codebase")
@@ -317,7 +336,7 @@ class Agents:
 
     # ------------------------------------------------------------------ reviewer
     def review(self, request: str, task: dict, diff: str, gates_text: str, notes: list[str], usage_text: str, emit: Emit, on_token) -> dict:
-        budget_chars = int(self.cfg.roles["reviewer"].prompt_budget() * 3.0)
+        budget_chars = int(self.cfg.roles["reviewer"].prompt_budget() * CHARS_PER_TOKEN)
         fixed = (f"<overall_request>\n{request[:1000]}\n</overall_request>\n{fmt_task(task)}\n<gate_results>\n{gates_text}\n</gate_results>\n"
                  + ("<notes>\n" + "\n".join(notes) + "\n</notes>\n" if notes else ""))
         room = max(2000, budget_chars - len(fixed) - 1500)

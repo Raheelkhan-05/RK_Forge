@@ -19,16 +19,17 @@ ROLES = ("planner", "context", "coder", "reviewer", "summarizer", "chat", "route
 # num_ctx must also be identical for every role, otherwise Ollama reloads the model when the context size changes.
 PROFILES: dict[str, dict] = {
     "quality": {"model": "qwen3.5:9b", "num_ctx": 12288},
-    "fast": {"model": "qwen3.5:4b", "num_ctx": 12288},
+    # "fast": {"model": "qwen3.5:4b", "num_ctx": 12288},
+    "fast": {"model": "qwen3.5:4b", "num_ctx": 8192},
 }
 
 ROLE_DEFAULTS: dict[str, dict] = {
     "planner": {"temperature": 0.2, "num_predict": 3072, "think": False},
     "context": {"temperature": 0.1, "num_predict": 1536, "think": False},
-    "coder": {"temperature": 0.1, "num_predict": 4096, "think": False},
+    "coder": {"temperature": 0.1, "num_predict": 3072, "think": False},
     "reviewer": {"temperature": 0.1, "num_predict": 2048, "think": False},
     "summarizer": {"temperature": 0.2, "num_predict": 1024, "think": False},
-    "chat": {"temperature": 0.4, "num_predict": 1800, "think": False},      # free conversation replies
+    "chat": {"temperature": 0.4, "num_predict": 1800, "think": False, "repeat_penalty": 1.05},     # free conversation replies
     "router": {"temperature": 0.0, "num_predict": 600, "think": False},     # reads the wording: discuss, ask or start a task
 }
 
@@ -49,6 +50,9 @@ class RoleCfg:
     temperature: float = 0.1
     num_predict: int = 2048
     think: bool = False
+    repeat_penalty: float = 1.0    # above 1 makes the model avoid repeating tokens, which breaks copying code exactly
+    num_gpu: int = -1              # -1 = let Ollama decide
+    num_thread: int = -1           # -1 = let Ollama decide
 
     def prompt_budget(self, reserve: int = 600) -> int:
         """Tokens available for the prompt (context window minus generation room minus slack)."""
@@ -76,6 +80,9 @@ class ChatCfg:
     memory_chars: int = 1600         # characters of recalled facts injected into each chat turn
     summary_trigger: int = 3000      # fold older messages into the running summary beyond this many characters
     keep_recent: int = 8             # newest messages that are never folded into the summary
+    prompt_tokens: int = 3500        # hard cap for one chat prompt; a small prompt is the biggest speed lever on a small GPU
+    llm_titles: bool = False         # ask the model for chat titles (extra call); the wording-based title is used otherwise
+
 
 
 @dataclass
@@ -169,8 +176,13 @@ class Config:
                     rc.model = top["default"]
                 if role in top:
                     rc.model = top[role]
-                if "num_ctx" in src.get("context", {}):
-                    rc.num_ctx = int(src["context"]["num_ctx"])
+                ctxs = src.get("context", {})
+                if "num_ctx" in ctxs:
+                    rc.num_ctx = int(ctxs["num_ctx"])
+                if "num_gpu" in ctxs:
+                    rc.num_gpu = int(ctxs["num_gpu"])
+                if "num_thread" in ctxs:
+                    rc.num_thread = int(ctxs["num_thread"])
                 for k, v in src.get("role", {}).get(role, {}).items():
                     if hasattr(rc, k):
                         setattr(rc, k, type(getattr(rc, k))(v))

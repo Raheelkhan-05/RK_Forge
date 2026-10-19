@@ -1,6 +1,7 @@
 """Chat layer tests. They use a scripted stand-in for Ollama and a small fake engine, so they need no model and no repo."""
 import threading
 
+from click import prompt
 import pytest
 
 from forge.chat import ChatService, compose_result, heuristic_title
@@ -126,6 +127,7 @@ def test_memory_conversations_search_and_facts(tmp_path):
 # ------------------------------------------------------------------ routing safety
 def test_discuss_reply_title_and_no_task(tmp_path):
     svc, eng = make(tmp_path, stream="The renew button resets validity because it recalculates the expiry.", title={"title": "Renew button validity"})
+    svc.cfg.chat.llm_titles = True
     cid = svc.new_chat()["id"]
     svc.post(cid, "Why does the renew button reset validity?")
     svc.drain()
@@ -239,11 +241,54 @@ def test_long_chat_recalls_early_details(tmp_path):
     svc.post(cid, "Remind me, what was the name of the nightly sync job we picked?")
     svc.drain()
     stream_calls = [c for c in svc.llm_fg.calls if c[1] == "stream"]
-    system = stream_calls[-1][2][0]["content"]
-    assert "PelicanSync" in system                                 # recovered from the summary / excerpts even though it is far outside the window
+    prompt = "\n".join(m["content"] for m in stream_calls[-1][2])
+    assert "PelicanSync" in prompt
     total = sum(len(m["content"]) for m in stream_calls[-1][2])
     assert total < svc.cfg.roles["chat"].prompt_budget() * 3.3    # stays inside the token budget
 
+def test_fix_and_decide_signals():
+    assert analyze("fix it").fix_ref and analyze("please try again").fix_ref and analyze("fix yourself").fix_ref
+    assert not analyze("fix the login bug").fix_ref
+    assert analyze("you decide").decide and analyze("I don't know").decide and not analyze("use Supabase").decide
+
+
+def test_fix_it_after_a_failed_task_retries_it_without_questions(tmp_path):
+    svc, eng = make(tmp_path)
+    cid = svc.new_chat()["id"]
+    rid = eng.submit("Make GST optional on the seller listing form", {"conv_id": cid, "title": "Make GST optional"})
+    eng.mem.add_msg(cid, "assistant", "run", "Started task: Make GST optional", {"run_id": rid, "title": "Make GST optional"})
+    eng.mem.update_run(rid, status="failed", error="tests failed")
+    eng.mem.emit(rid, "status", status="failed")
+    assert len(texts(eng, cid, "run_result")) == 1
+    svc.post(cid, "fix it")
+    svc.drain()
+    assert len(eng.submitted) == 2 and "tests failed" in eng.submitted[1][1]
+
+
+def test_you_decide_answers_a_waiting_task_with_the_safest_choice(tmp_path):
+    svc, eng = make(tmp_path)
+    cid = svc.new_chat()["id"]
+    given = []
+    eng.pending = lambda rid: {"kind": "clarification", "questions": ["Which form?", "Which field?"]}
+    eng.answer = lambda rid, answers: given.append(answers) or True
+    eng.mem.patch_state(cid, active_run="r1")
+    svc.post(cid, "I don't know, you decide")
+    svc.drain()
+    assert given == [["", ""]]
+    assert "safest" in texts(eng, cid, "text")[-1]["content"]
+
+
+def test_run_as_task_turns_open_questions_into_assumptions(tmp_path):
+    brief = dict(BRIEF, open_questions=["Which framework is used?"])
+    svc, eng = make(tmp_path, brief=brief)
+    cid = svc.new_chat()["id"]
+    svc.post(cid, "/task Make GST optional on the seller listing form")
+    svc.drain()
+    assert len(eng.submitted) == 1 and "safest option" in eng.submitted[0][1]
+
+
+def test_no_change_result_is_not_reported_as_applied():
+    assert "Nothing needed" in compose_result({"status": "done", "files": [], "summary": "Already optional.", "tasks": []})
 
 def test_facts_are_extracted_superseded_and_recalled(tmp_path):
     seen = {}
@@ -255,7 +300,7 @@ def test_facts_are_extracted_superseded_and_recalled(tmp_path):
         return {"facts": [{"kind": "decision", "text": "The seller GST field is optional on the listing form", "supersedes": []}], "forget": []}
 
     def stream(msgs):
-        seen["system"] = msgs[0]["content"]
+        seen["system"] = "\n".join(m["content"] for m in msgs)
         return "ok"
     svc, eng = make(tmp_path, facts=facts, stream=stream)
     cid = svc.new_chat()["id"]

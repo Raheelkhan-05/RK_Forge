@@ -15,6 +15,7 @@ from .chat import ChatService
 from .config import Config, PROFILES
 from .llm import OllamaLLM
 from .orchestrator import Engine, TERMINAL
+from contextlib import asynccontextmanager
 from .workspace import ConflictError, TxError
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
@@ -22,7 +23,22 @@ MEMORY_KINDS = ("fact", "preference", "decision", "project", "goal", "convention
 
 
 def create_app(engine: Engine, port: int = 8765) -> FastAPI:
-    app = FastAPI(title="Forge", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(_app):
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+
+        def quiet(lp, context):
+            if isinstance(context.get("exception"), (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+                return          # a browser tab closed its live connection; harmless noise on Windows
+            if previous:
+                previous(lp, context)
+            else:
+                lp.default_exception_handler(context)
+        loop.set_exception_handler(quiet)
+        yield
+
+    app = FastAPI(title="Forge", docs_url=None, redoc_url=None, lifespan=lifespan)
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost", "testserver"}
 
     @app.middleware("http")
@@ -313,6 +329,8 @@ def create_app(engine: Engine, port: int = 8765) -> FastAPI:
     @app.post("/api/runs/{rid}/undo")
     def undo(rid: str):
         r = need_run(rid)
+        if not r["files"]:
+            raise HTTPException(409, "This task did not change any files, so there is nothing to undo")
         if r["status"] != "done":
             raise HTTPException(409, "Only committed runs can be undone")
         try:

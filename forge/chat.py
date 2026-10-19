@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from .indexer import query_terms
 from .intent import Signals, analyze, code_names, looks_like_code_talk
 from .telemetry import Tracer
-from .llm import Cancelled, LLMError
+from .llm import CHARS_PER_TOKEN, Cancelled, LLMError
 from .memory import CHAT_KINDS, Memory
 from .workspace import TxError, norm_rel
 
@@ -64,7 +64,9 @@ How to behave:
 - If the discussion has reached a concrete change, say so in one sentence and tell the user they can press "Make this a task" or say "go ahead". Do not push for a task while they are still exploring.
 - If the user asks about a finished task, use the task result and <last_change_diff> to explain what changed and why, and point out risks honestly.
 - Match the user's language and tone (English, Hindi, Hinglish...). Be concise: short answers for simple questions, structured answers (short lists, small code blocks) for complex ones. No filler, do not repeat the question.
-- If the user asks you to remember or forget something, confirm in one short sentence; it is stored automatically."""
+- If the user asks you to remember or forget something, confirm in one short sentence; it is stored automatically.
+- Memory, earlier excerpts and code evidence arrive at the start of the user's latest message, inside <context>.
+- If a task is waiting for the user's answers, tell them they can simply say "you decide" and the safest option will be chosen."""
 
 ROUTER_SYS = """You are the intake step of a coding assistant. The assistant can (a) discuss freely with the user (explain code, compare options, answer follow-ups, brainstorm) and (b) run a coding task that edits the repository.
 Decide what the user's LATEST message needs. Read the recent conversation, the pending task brief (if any), the task state and the wording signals.
@@ -83,13 +85,14 @@ Rules:
 - confidence is how sure you are about BOTH the intent and whether the request is complete enough to act on.
 - needs_code is true when a good answer or brief needs the real repository (specific files, functions or behaviour). code_query: 2-6 keywords or names to look for.
 - Without a pending brief never answer confirm, revise or cancel.
-- When unsure between discuss and task, choose discuss."""
+- When unsure between discuss and task, choose discuss.
+- Only list blocking_questions for decisions that only the user can make. Never for tool names, file locations or anything visible in the repository or this conversation."""
 
 BRIEF_SYS = """You write the task brief for a coding pipeline from a conversation. A separate agent will plan and implement it without seeing this chat.
 - request: a complete, self-contained description (2-10 sentences) of exactly what to build or change, including every decision and constraint the user stated or agreed to. Mention file or component names only if the user or the code evidence gave them.
 - keep_working: existing behaviour that must not break (only if the user said so or it is obvious from the request).
 - assumptions: choices you had to make that the user did not state (short).
-- open_questions: things only the user can decide that would change the implementation (max 3, else empty).
+- open_questions: only things nobody can find in the repository, this conversation or saved memory. Never ask which tool, framework, file or hardware is used. If a sensible default exists, take it and list it under assumptions instead (max 2 questions, else empty).
 - title: at most 8 words.
 Never invent requirements, file names or APIs. If a previous brief is given, apply the user's latest message to it."""
 
@@ -187,6 +190,11 @@ def compose_result(run: dict) -> str:
     st = run.get("status")
     files = run.get("files") or []
     err = (run.get("error") or "").strip()
+    if not files:
+        out = ["**Nothing needed to change.**"]
+        if run.get("summary"):
+            out += ["", run["summary"]]
+        return "\n".join(out + ["", "Your files were not touched. Tell me if you want something changed anyway."])
     if st == "done":
         out = [f"**Done.** The task is applied to your project ({len(files)} file{'' if len(files) == 1 else 's'} changed)."]
         if run.get("summary"):
@@ -323,7 +331,11 @@ class ChatService:
             if job is not None:
                 self._run_job(job)
 
-    BG_IDLE = 6.0
+    BG_IDLE = 15.0
+
+    def _task_busy(self) -> bool:
+        """While a task runs, Ollama is busy with it. Chores wait so chat replies are not queued behind them."""
+        return bool(getattr(self.engine, "live", None))
 
     def _next(self):
         with self.cv:
@@ -332,7 +344,8 @@ class ChatService:
                     return None
                 if self.fg:
                     return self.fg.popleft()
-                if self.bg and time.time() - self.last_active >= self.BG_IDLE:
+                
+                if self.bg and time.time() - self.last_active >= self.BG_IDLE and not self._task_busy():
                     job = self.bg.popleft()
                     self._bg_keys.discard((job[0], job[1]))
                     return job
@@ -618,16 +631,64 @@ class ChatService:
             self._after_turn(cid)
 
     def _after_turn(self, cid: str) -> None:
-        self.schedule("title", cid)
+        if self.cfg.chat.llm_titles:
+            self.schedule("title", cid)
         self.schedule("extract", cid)
         self.schedule("fold", cid)
+
+    def _answer_for_run(self, cid: str, conv: dict, mid: int, sig: Signals) -> bool:
+        """A task is waiting for answers and the user says 'you decide' / 'I don't know': answer with 'choose the safest option'."""
+        if not sig.decide:
+            return False
+        rid = conv["state"].get("active_run")
+        pend = self.engine.pending(rid) if rid else None
+        answer = getattr(self.engine, "answer", None)
+        if not pend or pend.get("kind") not in ("clarification", "doubt") or answer is None:
+            return False
+        n = len(pend.get("questions") or [])
+        if not n or not answer(rid, [""] * n):
+            return False
+        self._say(cid, "Okay. I'll pick the safest option for those questions and carry on.", mid)
+        return True
+
+    @staticmethod
+    def _questions_to_assumptions(brief: dict) -> None:
+        if brief.get("open_questions"):
+            more = [f"Not decided, so take the safest option: {q}" for q in brief["open_questions"]]
+            brief["assumptions"] = ((brief.get("assumptions") or []) + more)[:8]
+            brief["open_questions"] = []
+
+    def _retry_brief(self, cid: str, msg: dict, sig: Signals) -> dict | None:
+        """'fix it' / 'try again' right after a task stopped: rebuild that task with the failure as a hint instead of asking the user to explain."""
+        if not sig.fix_ref:
+            return None
+        results = self.mem.find_msgs_conv(cid, "run_result", 3)
+        if not results:
+            return None
+        last = results[-1]
+        if last["meta"].get("status") not in ("failed", "conflict", "interrupted", "cancelled"):
+            return None
+        if any(m["id"] > last["id"] for m in self.mem.find_msgs_conv(cid, "run", 3)):
+            return None                                  # a newer task already exists
+        run = self.mem.get_run(last["meta"].get("run_id") or "")
+        if not run:
+            return None
+        base = run["request"].split("\n\nThe previous attempt of this task stopped")[0]
+        why = clip(run.get("error") or "", 600)
+        request = base + (f"\n\nThe previous attempt of this task stopped, so avoid that: {why}" if why else "")
+        return {"title": clip("Retry: " + (last["meta"].get("title") or heuristic_title(base)), 70), "request": clip(request, 6000),
+                "keep_working": [], "assumptions": ["Same goal as the stopped task; its failure is used as a hint"], "open_questions": []}
 
     def _run_turn(self, cid: str, conv: dict, msg: dict, sig: Signals, pending: dict | None) -> None:
         mid, text = msg["id"], msg["content"].strip()
         mode = msg["meta"].get("mode", "chat")
+        if self._answer_for_run(cid, conv, mid, sig):
+            return
         if mode in ("task", "brief"):
             self._phase(cid, "Preparing the task brief")
             brief = self._make_brief(cid, conv, msg, sig, None, [])
+            if mode == "task":
+                self._questions_to_assumptions(brief)       # "Run as task" means go: unknowns become stated assumptions
             self._post_brief(cid, brief, mid)
             if mode == "task":
                 self.start_task(cid, brief)
@@ -639,6 +700,14 @@ class ChatService:
             return
         if pending and sig.confirm:
             self.start_task(cid, pending)
+            return
+        retry = None if pending else self._retry_brief(cid, msg, sig)
+        if retry:
+            self._post_brief(cid, retry, mid)
+            if self.cfg.chat.auto_start and not sig.question:
+                self.start_task(cid, retry)
+            else:
+                self._say(cid, "I turned the stopped task back into a brief, with the failure as a hint. Press **Start task** when you're ready.", mid)
             return
         self._phase(cid, "Understanding your message")
         quick = (not pending and not sig.imperative and not sig.go and sig.words <= 40 and not looks_like_code_talk(text))
@@ -973,36 +1042,52 @@ class ChatService:
                 return []
 
     def _assemble_inner(self, cid: str, conv: dict, *, role: str, system: str, history_upto: int, final_user: str,
-                  extra=(), query: str = "", directive: str = "") -> tuple[list[dict], list[dict]]:
-        """System prompt + memory + summary + gap digest + retrieved excerpts + newest messages + the final user turn, in budget."""
+                        extra=(), query: str = "", directive: str = "") -> tuple[list[dict], list[dict]]:
+        """Stable system prompt + summary, then recent history, then ONE final user turn carrying every per-turn block.
+
+        Ollama keeps the evaluated prompt prefix between calls. Per-turn blocks (recalled memory, excerpts, code evidence)
+        therefore live in the last message, never at the top, and the history window only slides in big steps."""
         rc, cc = self.cfg.roles[role], self.cfg.chat
-        total = int(rc.prompt_budget() * 3.0)
+        total = int(min(rc.prompt_budget(), cc.prompt_tokens) * CHARS_PER_TOKEN)
         facts = self._recall(query, cc.memory_chars)
         mem_block = ("<project_memory>\n" + "\n".join(f"- [{f['kind']}] {f['text']}" for f in facts) + "\n</project_memory>") if facts else ""
-        summary = clip(conv.get("summary", ""), min(3000, int(total * 0.10)))
+        summary = clip(conv.get("summary", ""), min(3000, int(total * 0.18)))
         summary_block = f"<conversation_summary>\n{summary}\n</conversation_summary>" if summary else ""
         extra_text = "\n\n".join(x for x in extra if x)
-        extra_text = clip_mid(extra_text, int(total * 0.28)) if extra_text else ""
-        head = "\n\n".join(p for p in (system, directive) if p)
+        extra_text = clip_mid(extra_text, int(total * 0.30)) if extra_text else ""
         reserve = int(total * 0.17)
-        room = total - (len(head) + len(mem_block) + len(summary_block) + len(extra_text) + len(final_user) + reserve + 400)
+        fixed = len(system) + len(summary_block) + len(mem_block) + len(directive) + len(final_user) + reserve + 400
+        room = total - (fixed + len(extra_text))
         if room < 3000 and extra_text:
             extra_text = clip_mid(extra_text, max(600, len(extra_text) - (3000 - room)))
-            room = total - (len(head) + len(mem_block) + len(summary_block) + len(extra_text) + len(final_user) + reserve + 400)
+            room = total - (fixed + len(extra_text))
         room = max(room, 1500)
 
         cand = [m for m in self.mem.recent_msgs(cid, 80, before=history_upto) if not m["meta"].get("error")]
-        chosen: list[tuple[dict, str, str]] = []
-        used = 0
-        for m in reversed(cand):
-            r, t = self._turn_of(m)
-            t = clip_mid(t, 5000 if len(chosen) < 2 else 2200)
-            cost = len(t) + 12
-            if chosen and used + cost > room:
-                break
-            chosen.append((m, r, t))
-            used += cost
-        chosen.reverse()
+
+        def window(limit: int, floor: int = 0) -> list[tuple[dict, str, str]]:
+            picked, used = [], 0
+            for m in reversed(cand):
+                if m["id"] < floor:
+                    break
+                r, t = self._turn_of(m)
+                t = clip_mid(t, 5000 if len(picked) < 2 else 2200)
+                cost = len(t) + 12
+                if picked and used + cost > limit:
+                    break
+                picked.append((m, r, t))
+                used += cost
+            picked.reverse()
+            return picked
+
+        chosen = window(room)
+        pin = conv["state"].get("win_from") if role == "chat" else None
+        if chosen and pin and pin < chosen[0][0]["id"]:
+            kept = window(int(room * 1.4), pin)
+            if kept and kept[0][0]["id"] == pin:
+                chosen = kept                        # keep the old start so the front of the prompt stays identical
+        if chosen and role == "chat" and chosen[0][0]["id"] != pin:
+            self.mem.patch_state(cid, win_from=chosen[0][0]["id"])
         first_id = chosen[0][0]["id"] if chosen else history_upto
 
         gap_block = ""
@@ -1033,10 +1118,14 @@ class ChatService:
             if lines:
                 exc_block = "<earlier_excerpts>\n" + "\n".join(lines) + "\n</earlier_excerpts>"
 
-        system_text = "\n\n".join(p for p in (head, mem_block, summary_block, gap_block, exc_block, extra_text) if p)
+        parts = [p for p in (mem_block, gap_block, exc_block, extra_text) if p]
+        if directive:
+            parts.append(f"<instruction>\n{directive}\n</instruction>")
+        user_text = ("<context>\n" + "\n\n".join(parts) + "\n</context>\n\n" + final_user) if parts else final_user
+        system_text = system + (("\n\n" + summary_block) if summary_block else "")
         msgs = [{"role": "system", "content": system_text}]
         msgs += [{"role": r, "content": t} for _, r, t in chosen]
-        msgs.append({"role": "user", "content": final_user})
+        msgs.append({"role": "user", "content": user_text})
         return msgs, facts
 
     def _task_state(self, conv: dict) -> str:
@@ -1093,7 +1182,9 @@ class ChatService:
         tools = self._tooling()
         if tools is None:
             return blocks, paths, labels
-        budget = int(self.cfg.roles["chat"].prompt_budget() * 3.0 * 0.22)
+        
+        budget = int(min(self.cfg.roles["chat"].prompt_budget(), self.cfg.chat.prompt_tokens) * CHARS_PER_TOKEN * 0.22)
+        
         names = code_names(text)
         if names:
             self._phase(cid, "Looking at the code you mentioned")
@@ -1174,6 +1265,7 @@ class ChatService:
 
     # ------------------------------------------------------------------ background jobs
     def _job_title(self, cid: str) -> None:
+        if not self.cfg.chat.llm_titles: return
         conv = self.mem.get_conv(cid)
         if not conv or conv["title_locked"]:
             return
@@ -1247,7 +1339,9 @@ class ChatService:
         users = [m["content"] for m in new if m["role"] == "user" and m["kind"] == "text"]
         joined = " ".join(users)
         sig = analyze(joined)
-        worth = bool(users) and (sig.remember or sig.correction or len(joined) >= 80)
+        asked = [analyze(u) for u in users]
+        only_questions = bool(asked) and all(a.question and not a.remember and not a.correction and not a.imperative for a in asked)
+        worth = bool(users) and not only_questions and (sig.remember or sig.correction or len(joined) >= 80)
         if any(m["kind"] in ("run_result", "brief") for m in new) and users:
             worth = True
         if not worth:

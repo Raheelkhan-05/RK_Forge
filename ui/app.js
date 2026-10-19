@@ -171,6 +171,7 @@ async function loadStatus() {
   pill.className = 'pill ' + (o.ok ? 'ok' : 'bad');
   const gpu = (o.placement || []).find(p => p.gpu_pct != null);
   pill.textContent = o.ok ? `${coder.model} · ${coder.num_ctx.toLocaleString()} ctx` + (gpu ? ` · ${gpu.gpu_pct}% GPU` : '') : (o.error || 'Ollama unavailable');
+  pill.title = o.advice || ''; if (o.advice) pill.textContent += ' ⚠';
   const ix = S.cfg.index;
   $('#indexInfo').textContent = `${ix.files} files · ${ix.lines.toLocaleString()} lines · ${ix.projects.join(', ')}`;
   renderChatHeader();
@@ -390,6 +391,7 @@ function paintHero() {
     h('h2', {}, 'What are we working on?'),
     h('p', {}, 'Think it through first: ask how something works, compare options, or describe a change. I look at your real code, remember what you decide, and only touch your files after you confirm a task.'),
     h('div', {class: 'ideas'}, IDEAS.map(x => h('button', {onclick: () => { input.value = x; autosize(); input.focus(); saveDraft(); }}, x))),
+    o && o.ok && o.advice ? h('div', {class: 'setup', role: 'status'}, o.advice) : null,
     o && !o.ok ? h('div', {class: 'setup', role: 'alert'}, h('b', {}, 'Ollama needs attention. '), o.error || '', h('div', {class: 'small'}, 'Start Ollama, then run ', h('code', {}, 'ollama pull ' + (S.cfg.roles.chat ? S.cfg.roles.chat.model : 'qwen3.5:9b')), '.')) : null);
 }
 function paintOlder() {
@@ -658,7 +660,9 @@ function renderAttention() {
       h('h3', {}, p.kind === 'doubt' ? 'The coder is unsure and could not find the answer in your code' : 'A few answers needed before the task continues'),
       h('p', {}, p.kind === 'doubt' ? `Nothing has been changed. ${p.context || ''} Paste a decision, a snippet or a file path; it is remembered for later changes.` : (p.context || 'Short answers are fine. Leave one empty to let Forge choose the safest option.')),
       p.questions.map((q, i) => h('div', {class: 'q'}, h('label', {}, q), areas[i])),
-      h('div', {class: 'actions'}, h('button', {class: 'btn primary', onclick: async ev => { ev.target.disabled = true; try { await api(`/api/runs/${R.id}/answer`, 'POST', {answers: areas.map(a => a.value)}); } catch (e) { fail(e); ev.target.disabled = false; } }}, 'Send answers'))));
+      h('div', {class: 'actions'},
+        h('button', {class: 'btn primary', onclick: async ev => { ev.target.disabled = true; try { await api(`/api/runs/${R.id}/answer`, 'POST', {answers: areas.map(a => a.value)}); } catch (e) { fail(e); ev.target.disabled = false; } }}, 'Send answers'),
+        h('button', {class: 'btn', title: 'Forge picks the safest option and tells you what it assumed', onclick: async ev => { ev.target.disabled = true; try { await api(`/api/runs/${R.id}/answer`, 'POST', {answers: p.questions.map(() => '')}); } catch (e) { fail(e); ev.target.disabled = false; } }}, 'Let Forge decide'))));
   } else if (p.kind === 'approval') {
     const notes = h('textarea', {placeholder: 'What should be different? Forge will plan the follow-up and re-check everything.', hidden: true, 'aria-label': 'Requested changes'});
     const force = h('input', {type: 'checkbox'});

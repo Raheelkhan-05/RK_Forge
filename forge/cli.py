@@ -1,18 +1,36 @@
 # forge/cli.py
 
-"""Command line: forge serve | doctor | index | run"""
+"""Command line: forge serve | doctor | index | run | tune"""
 from __future__ import annotations
 
 import argparse
 import shutil
+import socket
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
-from pathlib import Path
 
 from .config import Config
 from .llm import OllamaLLM
+
+
+def port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def forge_running(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as r:
+            return "<title>Forge</title>" in r.read(4000).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def doctor(cfg: Config) -> int:
@@ -24,6 +42,10 @@ def doctor(cfg: Config) -> int:
     if h.get("error"):
         print(f"             {h['error']}")
         ok = False
+    for p in h.get("placement", []):
+        print(f"Loaded     : {p['name']}  {p['size_gb']} GB, {p['gpu_pct']}% on GPU, context {p['context']}")
+    if h.get("advice"):
+        print(f"             {h['advice']}")
     for name, tool in (("git", "git"), ("node", "node"), ("npm", "npm")):
         found = shutil.which(tool)
         print(f"{name:<11}: {found or 'not found'}")
@@ -40,7 +62,7 @@ def doctor(cfg: Config) -> int:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="forge", description="Local transactional multi-agent coding system")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("serve", "doctor", "index", "run"):
+    for name in ("serve", "doctor", "index", "run", "tune"):
         sp = sub.add_parser(name)
         sp.add_argument("--repo", default=".", help="path to the project (the folder that contains frontend/backend/admin)")
         if name == "serve":
@@ -49,10 +71,26 @@ def main(argv: list[str] | None = None) -> None:
         if name == "run":
             sp.add_argument("request")
             sp.add_argument("--auto-approve", action="store_true")
+        if name == "tune":
+            sp.add_argument("--model", default=None, help="model to test (default: the chat model)")
     args = ap.parse_args(argv)
     cfg = Config.load(args.repo)
     if args.cmd == "doctor":
         sys.exit(doctor(cfg))
+    if args.cmd == "tune":
+        from .tune import tune
+        sys.exit(tune(cfg, args.model))
+    if args.cmd == "serve":
+        # Check BEFORE the engine exists: a second engine on the same repo marks the first one's running task as interrupted.
+        url = f"http://127.0.0.1:{args.port}"
+        if not port_free(args.port):
+            if forge_running(args.port):
+                print(f"Forge is already running at {url}. Opening it. (Close the other Forge window first if you want to restart it.)")
+                if not args.no_browser:
+                    webbrowser.open(url)
+                return
+            print(f"Port {args.port} is used by another program. Try: python -m forge serve --repo . --port {args.port + 1}")
+            sys.exit(1)
     from .orchestrator import Engine
     engine = Engine(cfg)
     if engine.recovered:
@@ -70,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:
                 if ev["type"] in ("status", "plan", "task", "review", "error", "committed", "question", "approval"):
                     print(f"[{ev['type']}] {p.get('status') or p.get('title') or p.get('message') or p.get('verdict') or ''}")
                 if ev["type"] == "question":
-                    ans = [input(f"  {q}\n  > ") for q in p["questions"]]
+                    ans = [input(f"  {q}\n  (press Enter to let Forge decide)\n  > ") for q in p["questions"]]
                     engine.answer(rid, ans)
                 if ev["type"] == "approval":
                     if input("Approve and commit? [y/N] ").lower().startswith("y"):
@@ -85,7 +123,6 @@ def main(argv: list[str] | None = None) -> None:
     import uvicorn
     from .server import create_app
     engine.reindex()
-    url = f"http://127.0.0.1:{args.port}"
     print(f"Forge is running at {url}  (repo: {cfg.repo})")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
